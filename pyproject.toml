@@ -1,0 +1,22 @@
+[project]
+name = "jepa-test"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [{ name = "Ax-47", email = "@gmail.com" }]
+requires-python = ">=3.14"
+dependencies = [
+    "matplotlib>=3.11.2",
+    "torch>=2.14.0",
+    "torchvision>=0.29.0",
+    "tqdm>=4.70.1",
+]
+
+[project.scripts]
+train-jepa = "jepa_test.train:main"
+train-rl = "jepa_test.train_rl:main"
+play-jepa = "jepa_test.play:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
