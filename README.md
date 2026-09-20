@@ -442,7 +442,7 @@ Produces the JEPA checkpoint: `checkpoints/latest.pt`
 After JEPA training:
 
 ```bash
-uv run python -m active_jepa.train_rl
+uv run train-rl
 ```
 
 Produces: `checkpoints/rl_v2.pt`
