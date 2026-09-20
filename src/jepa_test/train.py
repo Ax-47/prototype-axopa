@@ -16,13 +16,29 @@ def compute_loss(
     label,
 ):
     # --------------------------------------------------
-    # JEPA latent prediction
+    # JEPA latent prediction — GLOBAL level (level 1)
     # --------------------------------------------------
 
-    jepa_loss = F.smooth_l1_loss(
+    jepa_loss_global = F.smooth_l1_loss(
         output["z_pred"],
         output["z_target"],
     )
+
+    # --------------------------------------------------
+    # JEPA latent prediction — LOCAL level (level 0)
+    #
+    # Without this term the local predictor / local tokens only ever get a
+    # gradient indirectly through the pixel-level reconstruction_loss below,
+    # so the "hierarchical" half of the model would never actually be doing
+    # latent-space prediction (the whole point of JEPA), only autoencoding.
+    # --------------------------------------------------
+
+    jepa_loss_local = F.smooth_l1_loss(
+        output["tokens_pred"],
+        output["tokens_target"],
+    )
+
+    jepa_loss = 0.5 * jepa_loss_global + 0.5 * jepa_loss_local
 
     # --------------------------------------------------
     # Classification
@@ -41,20 +57,30 @@ def compute_loss(
     classification_loss = 0.5 * classification_current + 0.5 * classification_pred
 
     # --------------------------------------------------
-    # Next partial observation
+    # Next partial observation (decoded from local tokens)
+    #
+    # BCE instead of MSE: the decoder ends in Sigmoid, and MSE's gradient
+    # w.r.t. the pre-Sigmoid logit carries an extra sigmoid'(z) factor that
+    # vanishes once the output saturates near 0 or 1 — so once the decoder
+    # starts predicting "all black" (a decent local minimum on MNIST, which
+    # is mostly background), gradient descent can get stuck there with a
+    # gradient that's ~0 no matter how wrong it is. BCE's gradient reduces
+    # to (prediction - target) with no extra vanishing factor, so it can
+    # still escape that trap.
     # --------------------------------------------------
 
-    reconstruction_loss = F.mse_loss(
-        output["reconstruction"],
+    reconstruction_loss = F.binary_cross_entropy(
+        output["reconstruction"].clamp(1e-6, 1 - 1e-6),
         next_image,
     )
 
     # --------------------------------------------------
-    # Full hidden image
+    # Full hidden image (decoded from global latent) — same Sigmoid/BCE
+    # reasoning applies here too.
     # --------------------------------------------------
 
-    full_image_loss = F.mse_loss(
-        output["full_reconstruction"],
+    full_image_loss = F.binary_cross_entropy(
+        output["full_reconstruction"].clamp(1e-6, 1 - 1e-6),
         full_image,
     )
 
@@ -65,12 +91,14 @@ def compute_loss(
     loss = (
         1.0 * jepa_loss
         + 1.0 * classification_loss
-        + 0.1 * reconstruction_loss
+        + 0.5 * reconstruction_loss
         + 0.5 * full_image_loss
     )
 
     return loss, {
         "jepa": jepa_loss.item(),
+        "jepa_global": jepa_loss_global.item(),
+        "jepa_local": jepa_loss_local.item(),
         "classification": classification_loss.item(),
         "reconstruction": reconstruction_loss.item(),
         "full_image": full_image_loss.item(),
@@ -168,7 +196,8 @@ def main():
 
             progress.set_postfix(
                 loss=f"{loss.item():.4f}",
-                jepa=f"{metrics['jepa']:.4f}",
+                jepa_g=f"{metrics['jepa_global']:.4f}",
+                jepa_l=f"{metrics['jepa_local']:.4f}",
                 cls=f"{metrics['classification']:.4f}",
                 full=f"{metrics['full_image']:.4f}",
             )

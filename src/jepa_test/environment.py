@@ -66,9 +66,12 @@ class ActiveMNISTEnv:
 
         # --------------------------------------------------
         # Current state
+        #
+        # Hierarchical encoder returns (z_global, tokens); the RL state is
+        # still built only from z_global so state_dim / layout is unchanged.
         # --------------------------------------------------
 
-        z = self.model.encode(image, mask)
+        z, tokens = self.model.encode(image, mask)
 
         current_logits = self.model.classifier(z)
 
@@ -111,8 +114,15 @@ class ActiveMNISTEnv:
             -1,
         )
 
-        z_pred = self.model.predict(
+        tokens_repeated = tokens.expand(
+            NUM_CELLS,
+            -1,
+            -1,
+        )
+
+        z_pred, tokens_pred = self.model.predict(
             z_repeated,
+            tokens_repeated,
             actions,
         )
 

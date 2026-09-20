@@ -1,8 +1,8 @@
 # Active JEPA
 
-**An experimental Active Perception system that combines JEPA-style latent prediction with a Deep Q-Network (DQN) to recognize MNIST digits while revealing as few image regions as possible.**
+**An experimental Active Perception system that combines a *hierarchical* JEPA-style latent predictor with a Deep Q-Network (DQN) to recognize MNIST digits while revealing as few image regions as possible.**
 
-Instead of seeing the entire image at once, the agent starts with a completely hidden image and decides — step by step — which region to reveal next. The model can also **imagine** what the complete image might look like before actually revealing a region.
+Instead of seeing the entire image at once, the agent starts with a completely hidden image and decides — step by step — which region to reveal next. The model predicts what it expects to happen at **two levels of abstraction** at once: a coarse, scene-level "what digit is this" belief, and a fine-grained, patch-level "what will this specific region look like" belief. It can **imagine** both before actually revealing a region.
 
 ```
              ┌──────────────────────┐
@@ -10,10 +10,11 @@ Instead of seeing the entire image at once, the agent starts with a completely h
              └──────────┬───────────┘
                          │
                          ▼
-                    JEPA Encoder
+              Hierarchical JEPA Encoder
+                 (local patches → global scene)
                          │
                          ▼
-                        z_t
+                  z_t  (global latent)
                          │
              ┌───────────┴───────────┐
              │                       │
@@ -50,7 +51,7 @@ Instead of seeing the entire image at once, the agent starts with a completely h
 - [Installation](#installation)
 - [Training](#training)
 - [Running the Agent](#running-the-agent)
-- [Why JEPA + RL?](#why-jepa--rl)
+- [Why Hierarchical JEPA + RL?](#why-hierarchical-jepa--rl)
 - [Future Work](#future-work)
 - [Status](#status)
 
@@ -73,10 +74,11 @@ Full Image
   Digit
 ```
 
-**Active JEPA** instead frames recognition as a sequential decision problem. The agent learns two related things:
+**Active JEPA** instead frames recognition as a sequential decision problem, and additionally frames *perception itself* as a two-level (hierarchical) problem. The agent learns three related things:
 
-1. **What is the digit**, given the information I currently have?
-2. **Which action should I take next** to reduce uncertainty as cheaply as possible?
+1. **What is the digit**, given the information I currently have? (global level)
+2. **What will this specific patch look like** once I reveal it? (local level)
+3. **Which action should I take next** to reduce uncertainty as cheaply as possible? (RL)
 
 ---
 
@@ -119,38 +121,50 @@ The model chooses a cell, reveals it, updates its belief, and chooses again. The
 
 ## Architecture
 
-### 1. JEPA Encoder
+The encoder is **hierarchical**: a local (patch-level) representation is built first, then aggregated into a global (scene-level) representation. Prediction, targets, and decoding all happen at *both* levels.
 
-The encoder receives the currently visible image **and** the visibility mask, and produces a latent representation:
+### 1. Local Encoder (Level 0)
+
+A conv trunk turns the visible image + mask into a **7×7 grid of 49 patch tokens** (128-dim each), then normalizes them:
 
 ```
 Partial Image ─────┐
-                    ├──► Encoder ───► z_t
+                    ├──► Conv trunk ───► 49 patch tokens ───► LayerNorm ───► tokens
 Mask ───────────────┘
 ```
 
-- Latent dimension: **128**
-- Implemented as convolutional layers followed by a linear projection.
+The `LayerNorm` matters: raw conv activations are unbounded, and without normalizing them here, the local predictor/decoder downstream can saturate.
 
-### 2. Target Encoder
+### 2. Global Aggregator (Level 1)
 
-A separate target encoder is maintained as an **EMA (Exponential Moving Average)** of the online encoder, and receives no direct gradient updates:
-
-```
-Online Encoder ───────► z
-       │
-       │ EMA
-       ▼
-Target Encoder ───────► z_target
-```
-
-The JEPA objective pulls the predicted latent toward the target latent:
+A small Transformer (with a learned CLS token) aggregates the 49 local tokens into a single 128-dim **global latent** `z`:
 
 ```
-z_pred ≈ z_target
+tokens ──► + positional embedding ──► Transformer (2 layers) ──► CLS output ──► z
 ```
 
-### 3. Action Encoder
+The Transformer's internal LayerNorm keeps `z` naturally well-scaled.
+
+### 3. Target Encoder
+
+A separate target encoder (covering *both* levels — local encoder + global aggregator) is maintained as an **EMA (Exponential Moving Average)** of the online encoder, and receives no direct gradient updates:
+
+```
+Online Encoder (local + global) ───────► z, tokens
+              │
+              │ EMA
+              ▼
+Target Encoder (local + global) ───────► z_target, tokens_target
+```
+
+The JEPA objective pulls each predicted latent toward its corresponding target latent, at both levels:
+
+```
+z_pred      ≈ z_target
+tokens_pred ≈ tokens_target
+```
+
+### 4. Action Encoder
 
 Actions are represented via an embedding:
 
@@ -164,21 +178,29 @@ Embedding
 action representation
 ```
 
-This lets the predictor model *"what will my latent representation look like if I reveal this particular cell?"*
+This lets both predictors model *"what will my representation look like if I reveal this particular cell?"* — at the scene level and at the patch level.
 
-### 4. JEPA Predictor
+### 5. JEPA Predictors (two, one per level)
 
-The predictor takes the current latent and an action, and predicts the resulting latent:
+**Global predictor** — same role as before, operating on the scene-level latent:
 
 ```
-(z_t, action) ───► Predictor ───► z_pred
+(z_t, action) ───► Global Predictor ───► z_pred
+```
+
+**Local predictor** — new: operates on the 49 patch tokens, broadcasting the action embedding to every token and applying a residual + LayerNorm:
+
+```
+(tokens_t, action) ───► Local Predictor ───► tokens_pred
 ```
 
 Conceptually:
 
-> "I currently see this." + "I am going to reveal cell 4." → "This is what I expect to know afterwards."
+> "I currently see this." + "I am going to reveal cell 4." → "This is what I expect to know about the whole scene, **and** what I expect each patch to look like, afterwards."
 
-### 5. Classifier
+### 6. Classifier
+
+Operates on the global latent, unchanged in spirit:
 
 ```
 z
@@ -200,9 +222,24 @@ confidence = probabilities.max()
 
 The classifier can estimate the current digit **without** requiring the full image.
 
-### 6. Full Image Decoder
+### 7. Decoders (two, one per level)
 
-The predictor's latent can also be decoded into an *imagined* complete image:
+**Local decoder** (`SpatialDecoder`) — reshapes the predicted patch tokens straight back into their native 7×7 spatial layout (no vector round-trip needed, since tokens already carry spatial structure) and decodes the **next partial observation**:
+
+```
+tokens_pred
+  │
+  ▼
+reshape to (128, 7, 7)
+  │
+  ▼
+Deconv stack
+  │
+  ▼
+28 × 28 imagined partial observation
+```
+
+**Global decoder** (`FullImageDecoder`) — decodes the predicted global latent into the **complete hidden image**, unchanged from before:
 
 ```
 z_pred
@@ -211,26 +248,26 @@ z_pred
 Full Image Decoder
   │
   ▼
-28 × 28 imagined image
+28 × 28 imagined full image
 ```
 
-During inference, three images can be displayed side by side:
+During inference, **four** images are displayed side by side:
 
-| Current Observation | JEPA Imagination | Real Full Image |
-|---|---|---|
-| visible regions only | predicted image | ground truth (debug only) |
+| Current Observation | Local Decoder (patch-level) | Global Decoder (scene-level) | Real Full Image |
+|---|---|---|---|
+| visible regions only | predicted next partial obs | predicted complete digit | ground truth (debug only) |
 
 ---
 
 ## DQN
 
-The JEPA model supplies information about the current state; the DQN decides what to do with it.
+The JEPA model supplies information about the current state; the DQN decides what to do with it. The state is built **only from the global latent** — the local patch tokens are used internally by the hierarchical predictor but are not fed into the DQN, so `state_dim` is unchanged from the non-hierarchical version.
 
 **State composition:**
 
 | Component | Dim |
 |---|---|
-| Latent representation | 128 |
+| Global latent representation | 128 |
 | Class probabilities | 10 |
 | Current entropy | 1 |
 | Current confidence | 1 |
@@ -260,14 +297,14 @@ Action selection: `action = q.argmax()`
 
 At every step:
 
-1. **Encode the current observation** → partial image + mask → `z_t`
+1. **Encode the current observation** → partial image + mask → `z_t` (global) + `tokens_t` (local)
 2. **Predict the current digit** → `z_t` → classifier → probabilities
-3. **Imagine every possible cell**:
+3. **Imagine every possible cell**, at both levels:
    ```
-   (z_t, cell 0) → z_pred → classify
-   (z_t, cell 1) → z_pred → classify
+   (z_t, tokens_t, cell 0) → z_pred, tokens_pred → classify
+   (z_t, tokens_t, cell 1) → z_pred, tokens_pred → classify
    ...
-   (z_t, cell 8) → z_pred → classify
+   (z_t, tokens_t, cell 8) → z_pred, tokens_pred → classify
    ```
    giving the DQN a look-ahead over possible future states.
 4. **Construct the state**: `z` + current prediction + confidence + entropy + opened mask + candidate predictions
@@ -279,37 +316,41 @@ At every step:
 
 ## Training Objectives
 
-The JEPA model is trained with multiple complementary losses.
+The JEPA model is trained with multiple complementary losses, now split across both levels of the hierarchy.
 
-**JEPA loss** — predictor matches the target latent:
+**JEPA loss** — predictor matches the target latent, at both levels:
 ```
-L_jepa = SmoothL1(z_pred, z_target)
+L_jepa_global = SmoothL1(z_pred, z_target)
+L_jepa_local  = SmoothL1(tokens_pred, tokens_target)
+L_jepa        = 0.5 × L_jepa_global + 0.5 × L_jepa_local
 ```
 
-**Classification loss** — applied to both current and predicted latents:
+**Classification loss** — applied to both current and predicted global latents:
 ```
 L_cls = CrossEntropy(logits, label)
 ```
 
-**Partial reconstruction** — decode the next partial observation:
+**Partial reconstruction** — decode the next partial observation from the local tokens:
 ```
-L_partial = MSE(reconstruction, next_image)
+L_partial = BCE(reconstruction, next_image)
 ```
 
-**Full image reconstruction** — decode the complete original image:
+**Full image reconstruction** — decode the complete original image from the global latent:
 ```
-L_full = MSE(full_reconstruction, full_image)
+L_full = BCE(full_reconstruction, full_image)
 ```
+
+> **Why BCE instead of MSE?** Both decoders end in a `Sigmoid`. MSE's gradient with respect to the pre-`Sigmoid` value carries an extra `sigmoid'(z)` factor that vanishes once the output saturates near 0 or 1 — so a decoder that starts predicting "all black" (a fairly good local minimum on MNIST, since most of the image is background) can get stuck there, with almost no gradient pushing it back out. BCE's gradient reduces to `(prediction - target)` with no vanishing factor, so it doesn't have this failure mode.
 
 **Total loss:**
 ```
 L = 1.0 × L_jepa
   + 1.0 × L_classification
-  + 0.1 × L_partial
+  + 0.5 × L_partial
   + 0.5 × L_full
 ```
 
-The reconstruction losses mainly provide extra learning signal and make the latent space more interpretable.
+The reconstruction losses mainly provide extra learning signal and make the latent space more interpretable — but they're also the *only* signal that trains the two decoder heads directly, which is why their weights are kept comparable to each other.
 
 ---
 
@@ -319,9 +360,13 @@ The DQN is trained to minimize unnecessary reveals while still identifying the d
 
 | Event | Reward |
 |---|---|
-| Reveal cell | −0.10 |
+| Reveal cell | −0.20 |
 | Correct STOP | +1.00 |
 | Wrong STOP | −1.00 |
+
+> **Why 0.20 instead of 0.10?** With the original cost, revealing one more cell only needed to improve accuracy by `reveal_cost / (correct_reward - wrong_reward) = 0.10 / 2.0 = 5%` to be "worth it" — a bar so low that the agent almost always kept opening cells instead of stopping early. Raising the cost to 0.20 raises that breakeven to ~10%, pushing the agent toward stopping sooner once it's genuinely confident.
+
+**Exploration also anneals a second knob**, `stop_exploration_probability` — the chance of forcing a random STOP action during ε-greedy exploration. It starts high (`0.60`) early in training so the replay buffer collects enough early-STOP examples for the Q-network to actually learn that stopping early can be good, then decays to `0.20` as training progresses and the policy becomes more competent.
 
 The goal isn't just *"recognize MNIST"* — it's:
 
@@ -335,24 +380,21 @@ The goal isn't just *"recognize MNIST"* — it's:
 uv run play-jepa
 ```
 
-The program continuously samples random MNIST test images and, for each one, repeats:
+The program opens one matplotlib window and plays through MNIST test images **automatically, one after another** — as soon as an image ends (via STOP or hitting the step cap), the next random image starts immediately in the same window. Close the window (or hit `Ctrl+C`) to stop.
+
+Four panels are shown for every step:
 
 ```
-Start with nothing → Choose cell → Reveal → Update belief → Choose cell / STOP → repeat
+┌────────────────────┬────────────────────┬────────────────────┬────────────────────┐
+│ Current Observation │   Local Decoder     │   Global Decoder    │   Real Full Image   │
+│  (visible so far)    │ (tokens → next obs) │  (z → full digit)   │   (ground truth)     │
+└────────────────────┴────────────────────┴────────────────────┴────────────────────┘
 ```
-
-After STOP, it immediately moves on to the next image. Stop the program with `Ctrl+C`.
 
 ### Example Output
 
 ```
-============================================================
-IMAGE #1
-MNIST index: 3842
-Real label: 7
-============================================================
-
-Step 1
+[Image 1] Step 1
 Opened: []
 Current prediction: 3
 Confidence: 0.4213
@@ -369,12 +411,10 @@ Candidate cells:
 
 ...
 
->>> STOP
+[Image 1] STOP | prediction=7 | real=7 | opened=2/9
 
-Prediction: 7
-Real label: 7
-Correct: True
-Opened 2/9 cells
+[Image 2] Step 1
+...
 ```
 
 ---
@@ -393,9 +433,10 @@ active-jepa/
 ├── src/
 │   └── active_jepa/
 │       ├── data.py
-│       ├── model.py
-│       ├── train.py
-│       ├── train_rl.py
+│       ├── model.py         # hierarchical JEPA (local + global)
+│       ├── environment.py   # Gym-style RL environment, wraps the JEPA model
+│       ├── train.py         # trains the JEPA (checkpoints/latest.pt)
+│       ├── train_rl.py      # trains the DQN (checkpoints/rl_v2.pt)
 │       ├── play.py
 │       └── rl.py
 │
@@ -437,6 +478,8 @@ uv run train-jepa
 
 Produces the JEPA checkpoint: `checkpoints/latest.pt`
 
+> Any time `model.py` changes (a new layer, a different loss target shape, etc.), this checkpoint is no longer compatible with the new architecture and must be regenerated from scratch.
+
 ### Train DQN
 
 After JEPA training:
@@ -447,6 +490,8 @@ uv run train-rl
 
 Produces: `checkpoints/rl_v2.pt`
 
+> This only needs to be re-run when the JEPA encoder's weights change (a new `checkpoints/latest.pt`) or when the reward/exploration hyperparameters in `train_rl.py` change — not when unrelated files are edited. The DQN operates on a fixed 168-dim state vector, so its architecture itself is stable across JEPA changes; it's the *meaning* of that state vector that shifts whenever the JEPA encoder is retrained.
+
 ---
 
 ## Running the Agent
@@ -455,36 +500,39 @@ Produces: `checkpoints/rl_v2.pt`
 uv run play-jepa
 ```
 
-The agent continuously plays random MNIST test images. Press `Ctrl+C` to stop.
+The agent continuously plays through random MNIST test images, one after another, in a single window. Close the window or press `Ctrl+C` to stop.
 
 ---
 
-## Why JEPA + RL?
+## Why Hierarchical JEPA + RL?
 
-JEPA and RL solve different parts of the problem:
+JEPA and RL solve different parts of the problem, and the hierarchy splits the JEPA half further:
 
-**JEPA** learns *"what do I expect to see?"* and *"what does this partial observation represent?"*
+**Local JEPA level** learns *"what will this specific patch look like once revealed?"*
+
+**Global JEPA level** learns *"what digit is this, given everything seen so far?"*
 
 **RL** learns *"what should I look at next?"*
 
 ```
-        JEPA
-         │
-   understand / predict
-         │
-         ▼
-       State
-         │
-         ▼
-        DQN
-         │
-   choose action
-         │
-         ▼
-   reveal / STOP
+              Local JEPA               Global JEPA
+                  │                         │
+          patch-level prediction   scene-level prediction
+                  │                         │
+                  └────────────┬────────────┘
+                                │
+                              State
+                                │
+                                ▼
+                               DQN
+                                │
+                         choose action
+                                │
+                                ▼
+                        reveal / STOP
 ```
 
-This separates **representation learning** from **decision making**.
+This separates **representation learning** (now itself split across two levels of abstraction) from **decision making**.
 
 ---
 
@@ -492,7 +540,8 @@ This separates **representation learning** from **decision making**.
 
 - Better information-gain based action selection
 - Multi-step JEPA prediction
-- Hierarchical JEPA
+- ~~Hierarchical JEPA~~ ✅ done — local (patch) + global (scene) levels
+- A third, even coarser level (e.g. digit-family clusters) for a deeper hierarchy
 - Vectorized environments for faster RL training
 - Cached JEPA representations
 - Larger image observation spaces
@@ -511,11 +560,11 @@ This separates **representation learning** from **decision making**.
 
 This is an experimental research/learning project exploring the combination of:
 
-- Joint Embedding Predictive Architectures (JEPA)
-- Representation learning
+- Hierarchical Joint Embedding Predictive Architectures (JEPA)
+- Representation learning at multiple levels of abstraction
 - Active perception
 - Reinforcement learning (DQN)
 - Latent-space prediction
 - Visual imagination
 
-The current environment is intentionally simple — MNIST + 3×3 region selection. The interesting part isn't MNIST classification itself, but **whether an agent can learn when and where to look**.
+The current environment is intentionally simple — MNIST + 3×3 region selection. The interesting part isn't MNIST classification itself, but **whether an agent can learn when and where to look, and whether local and global beliefs can be learned and predicted together.**

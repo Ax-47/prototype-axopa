@@ -24,6 +24,29 @@ def linear_epsilon(
     return start + progress * (end - start)
 
 
+def linear_stop_exploration(
+    step,
+    start=0.60,
+    end=0.20,
+    decay_steps=150_000,
+):
+    """
+    Probability of forcing a random STOP action during epsilon-greedy
+    exploration. Starts high so the replay buffer collects plenty of
+    early-STOP transitions (otherwise the Q-network never sees enough
+    examples to learn that stopping early can be worthwhile), then
+    decays so that later training relies more on cells actually explored
+    by the (increasingly competent) policy.
+    """
+
+    progress = min(
+        step / decay_steps,
+        1.0,
+    )
+
+    return start + progress * (end - start)
+
+
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -91,8 +114,11 @@ def main():
         model=jepa,
         dataset=dataset,
         device=device,
-        # Stronger pressure to stop.
-        reveal_cost=0.10,
+        # Raised from 0.10: with the old cost, opening a cell only needed to
+        # improve accuracy by ~5% to be "worth it" (reveal_cost / (correct_reward
+        # - wrong_reward) = 0.10 / 2.0), so the agent almost always kept opening
+        # cells instead of stopping. 0.20 raises that breakeven to ~10%.
+        reveal_cost=0.20,
         correct_reward=1.0,
         wrong_reward=-1.0,
         max_steps=9,
@@ -170,12 +196,14 @@ def main():
         while not done:
             epsilon = linear_epsilon(global_step)
 
+            stop_exploration_probability = linear_stop_exploration(global_step)
+
             action = select_action(
                 q_network,
                 state,
                 epsilon,
                 device,
-                stop_exploration_probability=0.30,
+                stop_exploration_probability=stop_exploration_probability,
             )
 
             next_state, reward, done, info = env.step(action)
@@ -222,6 +250,7 @@ def main():
             opened=opened,
             correct=correct,
             epsilon=f"{epsilon:.3f}",
+            stop_exp=f"{stop_exploration_probability:.3f}",
             replay=len(replay_buffer),
         )
 

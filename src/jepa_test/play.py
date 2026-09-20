@@ -38,7 +38,8 @@ def imagine_full_image(
 
     mask_batch = current_mask.unsqueeze(0).to(device)
 
-    z = model.encode(
+    # Hierarchical encoder returns the global latent AND the local token grid.
+    z, tokens = model.encode(
         image_batch,
         mask_batch,
     )
@@ -49,12 +50,23 @@ def imagine_full_image(
         dtype=torch.long,
     )
 
-    z_pred = model.predict(
+    # Hierarchical predict runs both levels: global latent + local tokens.
+    z_pred, tokens_pred = model.predict(
         z,
+        tokens,
         action_tensor,
     )
 
-    imagined_image = model.full_image_decoder(z_pred)
+    # --------------------------------------------------
+    # BOTH decoders now run:
+    #
+    #   - decoder (level 0 / local):  tokens_pred -> next partial observation
+    #   - full_image_decoder (level 1 / global): z_pred -> complete hidden image
+    # --------------------------------------------------
+
+    local_imagined_image = model.decoder(tokens_pred)
+
+    global_imagined_image = model.full_image_decoder(z_pred)
 
     imagined_logits = model.classifier(z_pred)
 
@@ -64,7 +76,8 @@ def imagine_full_image(
     )
 
     return (
-        imagined_image.squeeze(0),
+        local_imagined_image.squeeze(0),
+        global_imagined_image.squeeze(0),
         imagined_probabilities.squeeze(0),
     )
 
@@ -85,7 +98,7 @@ def build_state(
 
     mask_batch = current_mask.unsqueeze(0).to(device)
 
-    z = model.encode(
+    z, tokens = model.encode(
         image_batch,
         mask_batch,
     )
@@ -131,8 +144,15 @@ def build_state(
         -1,
     )
 
-    z_pred = model.predict(
+    tokens_repeated = tokens.expand(
+        NUM_CELLS,
+        -1,
+        -1,
+    )
+
+    z_pred, tokens_pred = model.predict(
         z_repeated,
+        tokens_repeated,
         actions,
     )
 
@@ -160,6 +180,10 @@ def build_state(
 
     candidate_features = candidate_features.flatten()
 
+    # NOTE: the RL state is still built only from the global (level-1) latent
+    # `z`, exactly as before, so state_dim (and the trained QNetwork/rl_v2.pt
+    # checkpoint) stay unchanged. The local token grid `tokens` is only used
+    # internally to drive the hierarchical predictor above.
     state = torch.cat(
         [
             z.squeeze(0),
@@ -187,13 +211,14 @@ def create_visualizer():
 
     fig, axes = plt.subplots(
         1,
-        3,
-        figsize=(12, 4),
+        4,
+        figsize=(16, 4),
     )
 
     ax_current = axes[0]
-    ax_imagined = axes[1]
-    ax_real = axes[2]
+    ax_local = axes[1]
+    ax_global = axes[2]
+    ax_real = axes[3]
 
     current_display = ax_current.imshow(
         torch.zeros(28, 28),
@@ -202,7 +227,14 @@ def create_visualizer():
         vmax=1,
     )
 
-    imagined_display = ax_imagined.imshow(
+    local_display = ax_local.imshow(
+        torch.zeros(28, 28),
+        cmap="gray",
+        vmin=0,
+        vmax=1,
+    )
+
+    global_display = ax_global.imshow(
         torch.zeros(28, 28),
         cmap="gray",
         vmin=0,
@@ -218,7 +250,9 @@ def create_visualizer():
 
     ax_current.set_title("Current Observation")
 
-    ax_imagined.set_title("JEPA Imagination")
+    ax_local.set_title("Local Decoder\n(tokens -> next partial obs)")
+
+    ax_global.set_title("Global Decoder\n(z -> full image)")
 
     ax_real.set_title("Real Full Image")
 
@@ -230,10 +264,12 @@ def create_visualizer():
     return (
         fig,
         ax_current,
-        ax_imagined,
+        ax_local,
+        ax_global,
         ax_real,
         current_display,
-        imagined_display,
+        local_display,
+        global_display,
         real_display,
     )
 
@@ -241,16 +277,20 @@ def create_visualizer():
 def update_visualizer(
     fig,
     current_display,
-    imagined_display,
+    local_display,
+    global_display,
     real_display,
     current_image,
-    imagined_image,
+    local_imagined_image,
+    global_imagined_image,
     real_image,
     title,
 ):
     current_display.set_data(current_image.squeeze(0).cpu())
 
-    imagined_display.set_data(imagined_image.squeeze(0).cpu())
+    local_display.set_data(local_imagined_image.squeeze(0).cpu())
+
+    global_display.set_data(global_imagined_image.squeeze(0).cpu())
 
     real_display.set_data(real_image.squeeze(0).cpu())
 
@@ -273,7 +313,8 @@ def run_episode(
     device,
     fig,
     current_display,
-    imagined_display,
+    local_display,
+    global_display,
     real_display,
     episode_index,
 ):
@@ -379,7 +420,11 @@ def run_episode(
                 opened,
             )
 
-            final_imagination, _ = imagine_full_image(
+            (
+                final_local_imagination,
+                final_global_imagination,
+                _,
+            ) = imagine_full_image(
                 model,
                 image,
                 opened,
@@ -390,10 +435,12 @@ def run_episode(
             update_visualizer(
                 fig,
                 current_display,
-                imagined_display,
+                local_display,
+                global_display,
                 real_display,
                 current_image,
-                final_imagination,
+                final_local_imagination,
+                final_global_imagination,
                 image,
                 (
                     f"[Image {episode_index}] STOP | "
@@ -411,7 +458,11 @@ def run_episode(
 
         print(f">>> Reveal cell {action}")
 
-        imagined_image, imagined_probs = imagine_full_image(
+        (
+            local_imagined_image,
+            global_imagined_image,
+            imagined_probs,
+        ) = imagine_full_image(
             model,
             image,
             opened,
@@ -438,10 +489,12 @@ def run_episode(
         update_visualizer(
             fig,
             current_display,
-            imagined_display,
+            local_display,
+            global_display,
             real_display,
             current_image,
-            imagined_image,
+            local_imagined_image,
+            global_imagined_image,
             image,
             (
                 f"[Image {episode_index}] Step {step + 1} | "
@@ -462,10 +515,12 @@ def run_episode(
         update_visualizer(
             fig,
             current_display,
-            imagined_display,
+            local_display,
+            global_display,
             real_display,
             current_image,
-            imagined_image,
+            local_imagined_image,
+            global_imagined_image,
             image,
             (
                 f"[Image {episode_index}] Revealed cell {action} | "
@@ -547,10 +602,12 @@ def main():
     (
         fig,
         ax_current,
-        ax_imagined,
+        ax_local,
+        ax_global,
         ax_real,
         current_display,
-        imagined_display,
+        local_display,
+        global_display,
         real_display,
     ) = create_visualizer()
 
@@ -581,7 +638,8 @@ def main():
             device,
             fig,
             current_display,
-            imagined_display,
+            local_display,
+            global_display,
             real_display,
             episode_index,
         )
