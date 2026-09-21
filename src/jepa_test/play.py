@@ -1,209 +1,36 @@
+"""
+Hybrid planner -- greedy JEPA planner + DQN tie-breaker (interactive viewer).
+
+The decision logic lives in planner.py (shared with eval_rl.py); this file
+only plays MNIST test images one after another and draws what the model
+believes at every step.
+
+For every step, planner.plan_action:
+
+  1. Builds the same state used to train the DQN (environment.build_state).
+  2. Computes an expected value for every possible action (STOP, or reveal
+     cell c) from the AccuracyHead's P(correct) -- see planner.py.
+  3. If exactly one action has (approximately) the best value, that's the
+     move. If several are within TIE_THRESHOLD, the DQN picks among ONLY
+     those tied actions.
+
+Needs both checkpoints/latest.pt (JEPA) and checkpoints/rl_v2.pt (DQN).
+"""
+
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 import torchvision
-from torchvision import transforms
 from torchvision.datasets import MNIST
 
-from .data import reveal_cells
-from .model import ActiveJEPA
-from .rl import QNetwork, mask_invalid_actions
-
-NUM_CELLS = 9
-STOP_ACTION = 9
+from .data import NUM_CELLS, STOP_ACTION, reveal_cells
+from .environment import STATE_DIM, entropy
+from .eval_rl import load_dqn, load_jepa
+from .planner import TIE_THRESHOLD, plan_action
 
 # How many images to play through automatically.
 # Set to None to keep going forever (until the plot window is closed).
 NUM_EPISODES = None
-
-
-def entropy(probabilities):
-    return -(probabilities * torch.log(probabilities.clamp_min(1e-8))).sum(dim=-1)
-
-
-@torch.no_grad()
-def imagine_full_image(
-    model,
-    image,
-    opened,
-    action,
-    device,
-):
-    current_image, current_mask = reveal_cells(
-        image,
-        opened,
-    )
-
-    image_batch = current_image.unsqueeze(0).to(device)
-
-    mask_batch = current_mask.unsqueeze(0).to(device)
-
-    # Hierarchical encoder returns the global latent AND the local token grid.
-    z, tokens = model.encode(
-        image_batch,
-        mask_batch,
-    )
-
-    action_tensor = torch.tensor(
-        [action],
-        device=device,
-        dtype=torch.long,
-    )
-
-    # Hierarchical predict runs both levels: global latent + local tokens.
-    z_pred, tokens_pred = model.predict(
-        z,
-        tokens,
-        action_tensor,
-    )
-
-    # --------------------------------------------------
-    # BOTH decoders now run:
-    #
-    #   - decoder (level 0 / local):  tokens_pred -> next partial observation
-    #   - full_image_decoder (level 1 / global): z_pred -> complete hidden image
-    # --------------------------------------------------
-
-    local_imagined_image = model.decoder(tokens_pred)
-
-    global_imagined_image = model.full_image_decoder(z_pred)
-
-    imagined_logits = model.classifier(z_pred)
-
-    imagined_probabilities = F.softmax(
-        imagined_logits,
-        dim=-1,
-    )
-
-    return (
-        local_imagined_image.squeeze(0),
-        global_imagined_image.squeeze(0),
-        imagined_probabilities.squeeze(0),
-    )
-
-
-@torch.no_grad()
-def build_state(
-    model,
-    image,
-    opened,
-    device,
-):
-    current_image, current_mask = reveal_cells(
-        image,
-        opened,
-    )
-
-    image_batch = current_image.unsqueeze(0).to(device)
-
-    mask_batch = current_mask.unsqueeze(0).to(device)
-
-    z, tokens = model.encode(
-        image_batch,
-        mask_batch,
-    )
-
-    logits = model.classifier(z)
-
-    probabilities = F.softmax(
-        logits,
-        dim=-1,
-    )
-
-    current_entropy = entropy(probabilities)
-
-    current_confidence = probabilities.max(dim=-1).values
-
-    opened_ratio = torch.tensor(
-        [len(opened) / NUM_CELLS],
-        device=device,
-        dtype=z.dtype,
-    )
-
-    opened_mask = torch.zeros(
-        NUM_CELLS,
-        device=device,
-        dtype=z.dtype,
-    )
-
-    for cell in opened:
-        opened_mask[cell] = 1.0
-
-    # --------------------------------------------------
-    # Imagine every possible action
-    # --------------------------------------------------
-
-    actions = torch.arange(
-        NUM_CELLS,
-        device=device,
-        dtype=torch.long,
-    )
-
-    z_repeated = z.expand(
-        NUM_CELLS,
-        -1,
-    )
-
-    tokens_repeated = tokens.expand(
-        NUM_CELLS,
-        -1,
-        -1,
-    )
-
-    z_pred, tokens_pred = model.predict(
-        z_repeated,
-        tokens_repeated,
-        actions,
-    )
-
-    imagined_logits = model.classifier(z_pred)
-
-    imagined_probabilities = F.softmax(
-        imagined_logits,
-        dim=-1,
-    )
-
-    imagined_entropy = entropy(imagined_probabilities)
-
-    imagined_confidence = imagined_probabilities.max(dim=-1).values
-
-    candidate_features = torch.stack(
-        [
-            imagined_entropy,
-            imagined_confidence,
-        ],
-        dim=-1,
-    )
-
-    for cell in opened:
-        candidate_features[cell] = 0.0
-
-    candidate_features = candidate_features.flatten()
-
-    # NOTE: the RL state is still built only from the global (level-1) latent
-    # `z`, exactly as before, so state_dim (and the trained QNetwork/rl_v2.pt
-    # checkpoint) stay unchanged. The local token grid `tokens` is only used
-    # internally to drive the hierarchical predictor above.
-    state = torch.cat(
-        [
-            z.squeeze(0),
-            probabilities.squeeze(0),
-            current_entropy,
-            current_confidence,
-            opened_ratio,
-            opened_mask,
-            candidate_features,
-        ],
-        dim=0,
-    )
-
-    return (
-        state,
-        probabilities.squeeze(0),
-        imagined_probabilities,
-        imagined_entropy,
-        imagined_confidence,
-    )
 
 
 def create_visualizer():
@@ -211,14 +38,15 @@ def create_visualizer():
 
     fig, axes = plt.subplots(
         1,
-        4,
-        figsize=(16, 4),
+        5,
+        figsize=(20, 4),
     )
 
     ax_current = axes[0]
     ax_local = axes[1]
-    ax_global = axes[2]
-    ax_real = axes[3]
+    ax_mid = axes[2]
+    ax_global = axes[3]
+    ax_real = axes[4]
 
     current_display = ax_current.imshow(
         torch.zeros(28, 28),
@@ -228,6 +56,13 @@ def create_visualizer():
     )
 
     local_display = ax_local.imshow(
+        torch.zeros(28, 28),
+        cmap="gray",
+        vmin=0,
+        vmax=1,
+    )
+
+    mid_display = ax_mid.imshow(
         torch.zeros(28, 28),
         cmap="gray",
         vmin=0,
@@ -250,9 +85,11 @@ def create_visualizer():
 
     ax_current.set_title("Current Observation")
 
-    ax_local.set_title("Local Decoder\n(tokens -> next partial obs)")
+    ax_local.set_title("Local Decoder\n(chosen cell)")
 
-    ax_global.set_title("Global Decoder\n(z -> full image)")
+    ax_mid.set_title("Mid Decoder\n(chosen cell)")
+
+    ax_global.set_title("Global Decoder\n(chosen cell)")
 
     ax_real.set_title("Real Full Image")
 
@@ -263,12 +100,9 @@ def create_visualizer():
 
     return (
         fig,
-        ax_current,
-        ax_local,
-        ax_global,
-        ax_real,
         current_display,
         local_display,
+        mid_display,
         global_display,
         real_display,
     )
@@ -278,10 +112,12 @@ def update_visualizer(
     fig,
     current_display,
     local_display,
+    mid_display,
     global_display,
     real_display,
     current_image,
     local_imagined_image,
+    mid_imagined_image,
     global_imagined_image,
     real_image,
     title,
@@ -289,6 +125,8 @@ def update_visualizer(
     current_display.set_data(current_image.squeeze(0).cpu())
 
     local_display.set_data(local_imagined_image.squeeze(0).cpu())
+
+    mid_display.set_data(mid_imagined_image.squeeze(0).cpu())
 
     global_display.set_data(global_imagined_image.squeeze(0).cpu())
 
@@ -302,10 +140,49 @@ def update_visualizer(
     fig.canvas.draw_idle()
     fig.canvas.flush_events()
 
-    # Small pause so matplotlib actually renders.
     plt.pause(3)
 
 
+@torch.no_grad()
+def imagine(model, info, action, device):
+    """What the three decoders expect to see after `action` (STOP is an exact
+    identity map in the predictors, so this also works for STOP). Only the
+    chosen action is imagined -- the planner no longer needs the other eight
+    (it reads the AccuracyHead instead)."""
+
+    action_tensor = torch.tensor(
+        [action],
+        device=device,
+        dtype=torch.long,
+    )
+
+    z_pred, tokens_mid_pred, tokens_local_pred = model.predict(
+        info["z"],
+        info["tokens_mid"],
+        info["tokens_local"],
+        action_tensor,
+    )
+
+    local_image = model.decoder(tokens_local_pred).squeeze(0)
+
+    mid_image = model.mid_decoder(tokens_mid_pred).squeeze(0)
+
+    global_image = model.full_image_decoder(z_pred).squeeze(0)
+
+    imagined_probabilities = F.softmax(
+        model.classifier(z_pred),
+        dim=-1,
+    ).squeeze(0)
+
+    return (
+        local_image,
+        mid_image,
+        global_image,
+        imagined_probabilities,
+    )
+
+
+@torch.no_grad()
 def run_episode(
     model,
     q_network,
@@ -314,12 +191,11 @@ def run_episode(
     fig,
     current_display,
     local_display,
+    mid_display,
     global_display,
     real_display,
     episode_index,
 ):
-    """Play one image end-to-end (STOP action or step cap), then return."""
-
     index = torch.randint(
         0,
         len(dataset),
@@ -330,31 +206,22 @@ def run_episode(
 
     opened = []
 
-    for step in range(10):
-        (
-            state,
-            probabilities,
-            imagined_probabilities,
-            imagined_entropy,
-            imagined_confidence,
-        ) = build_state(
+    # At most NUM_CELLS reveals, then the planner has only STOP left, so the
+    # loop always ends with a STOP inside it.
+    for step in range(NUM_CELLS + 1):
+        plan = plan_action(
             model,
+            q_network,
             image,
             opened,
             device,
         )
 
-        state_batch = state.unsqueeze(0).to(device)
+        action = plan["action"]
 
-        with torch.no_grad():
-            q_values = q_network(state_batch)
+        info = plan["info"]
 
-            q_values = mask_invalid_actions(
-                q_values,
-                state_batch,
-            )
-
-        q = q_values.squeeze(0)
+        probabilities = info["probabilities"]
 
         prediction = probabilities.argmax().item()
 
@@ -372,31 +239,50 @@ def run_episode(
         print(f"Confidence: {confidence:.4f}")
 
         print(f"Entropy: {current_entropy:.4f}")
-
         print()
-        print("Candidate cells:")
-
-        for cell in range(NUM_CELLS):
-            if cell in opened:
-                continue
-
-            imagined_prediction = imagined_probabilities[cell].argmax().item()
-
-            imagined_conf = imagined_confidence[cell].item()
-
-            imagined_ent = imagined_entropy[cell].item()
-
-            print(
-                f"  cell {cell}: "
-                f"Q={q[cell].item():+.4f} | "
-                f"digit={imagined_prediction} | "
-                f"conf={imagined_conf:.4f} | "
-                f"entropy={imagined_ent:.4f}"
+        print("Candidate values:")
+        for candidate_action, value in sorted(
+            plan["values"].items(),
+            key=lambda item: -item[1],
+        ):
+            label_text = (
+                "STOP"
+                if candidate_action == STOP_ACTION
+                else f"cell {candidate_action}"
             )
 
-        print(f"  STOP: Q={q[STOP_ACTION].item():+.4f}")
+            tie_marker = " (tied)" if candidate_action in plan["tied_actions"] else ""
 
-        action = q.argmax().item()
+            chosen_marker = " <-- chosen" if candidate_action == action else ""
+
+            print(
+                f"  {label_text}: value={value:+.4f} "
+                f"P(correct)={plan['accuracy'][candidate_action]:.3f}"
+                f"{tie_marker}{chosen_marker}"
+            )
+
+        if plan["tie_broken_by_dqn"]:
+            print(
+                f"  -> tie among {plan['tied_actions']} within {TIE_THRESHOLD}, "
+                f"DQN broke the tie -> chose {action}"
+            )
+
+        (
+            local_image,
+            mid_image,
+            global_image,
+            imagined_probabilities,
+        ) = imagine(
+            model,
+            info,
+            action,
+            device,
+        )
+
+        current_image, _ = reveal_cells(
+            image,
+            opened,
+        )
 
         # --------------------------------------------------
         # STOP
@@ -414,33 +300,17 @@ def run_episode(
 
             print(f"Opened {len(opened)}/9 cells")
 
-            # Show final current image.
-            current_image, _ = reveal_cells(
-                image,
-                opened,
-            )
-
-            (
-                final_local_imagination,
-                final_global_imagination,
-                _,
-            ) = imagine_full_image(
-                model,
-                image,
-                opened,
-                STOP_ACTION,
-                device,
-            )
-
             update_visualizer(
                 fig,
                 current_display,
                 local_display,
+                mid_display,
                 global_display,
                 real_display,
                 current_image,
-                final_local_imagination,
-                final_global_imagination,
+                local_image,
+                mid_image,
+                global_image,
                 image,
                 (
                     f"[Image {episode_index}] STOP | "
@@ -453,60 +323,34 @@ def run_episode(
             return
 
         # --------------------------------------------------
-        # Reveal
+        # Reveal the chosen cell
         # --------------------------------------------------
 
         print(f">>> Reveal cell {action}")
 
-        (
-            local_imagined_image,
-            global_imagined_image,
-            imagined_probs,
-        ) = imagine_full_image(
-            model,
-            image,
-            opened,
-            action,
-            device,
-        )
-
-        imagined_prediction = imagined_probs.argmax().item()
-
-        imagined_confidence_value = imagined_probs.max().item()
-
-        print("JEPA imagined full image:")
-
-        print(f"  digit = {imagined_prediction}")
-
-        print(f"  confidence = {imagined_confidence_value:.4f}")
-
-        # Current image BEFORE opening cell.
-        current_image, _ = reveal_cells(
-            image,
-            opened,
-        )
+        imagined_prediction = imagined_probabilities.argmax().item()
 
         update_visualizer(
             fig,
             current_display,
             local_display,
+            mid_display,
             global_display,
             real_display,
             current_image,
-            local_imagined_image,
-            global_imagined_image,
+            local_image,
+            mid_image,
+            global_image,
             image,
             (
                 f"[Image {episode_index}] Step {step + 1} | "
                 f"action=cell {action} | "
-                f"JEPA predicts "
-                f"{imagined_prediction}"
+                f"JEPA predicts {imagined_prediction}"
             ),
         )
 
         opened.append(action)
 
-        # Update immediately after actual reveal.
         current_image, _ = reveal_cells(
             image,
             opened,
@@ -516,29 +360,19 @@ def run_episode(
             fig,
             current_display,
             local_display,
+            mid_display,
             global_display,
             real_display,
             current_image,
-            local_imagined_image,
-            global_imagined_image,
+            local_image,
+            mid_image,
+            global_image,
             image,
             (
                 f"[Image {episode_index}] Revealed cell {action} | "
                 f"opened={len(opened)}/9"
             ),
         )
-
-    # Step cap reached without a STOP action.
-    print()
-    print(">>> Step cap reached (no STOP)")
-
-    print(f"Prediction: {prediction}")
-
-    print(f"Real label: {label}")
-
-    print(f"Correct: {prediction == label}")
-
-    print(f"Opened {len(opened)}/9 cells")
 
 
 def main():
@@ -547,46 +381,29 @@ def main():
     print(f"device: {device}")
 
     # --------------------------------------------------
-    # JEPA
+    # JEPA (frozen, eval mode)
     # --------------------------------------------------
 
-    model = ActiveJEPA(latent_dim=128).to(device)
-
-    checkpoint = torch.load(
+    model = load_jepa(
         "checkpoints/latest.pt",
-        map_location=device,
-        weights_only=False,
+        device,
     )
 
-    model.load_state_dict(checkpoint["model"])
-
-    model.eval()
-
     # --------------------------------------------------
-    # DQN
+    # DQN (used only as a tie-breaker)
     # --------------------------------------------------
 
-    q_network = QNetwork(
-        state_dim=168,
-        hidden_dim=256,
-        num_actions=10,
-    ).to(device)
-
-    rl_checkpoint = torch.load(
+    q_network = load_dqn(
         "checkpoints/rl_v2.pt",
-        map_location=device,
-        weights_only=False,
+        device,
     )
 
-    q_network.load_state_dict(rl_checkpoint["q_network"])
+    assert q_network.net[0].in_features == STATE_DIM, (
+        "DQN checkpoint was trained with a different state layout; "
+        "retrain it with train_rl.py"
+    )
 
-    q_network.eval()
-
-    print("JEPA + DQN v2 loaded.")
-
-    # --------------------------------------------------
-    # MNIST
-    # --------------------------------------------------
+    print("JEPA + DQN (tie-breaker) loaded.")
 
     dataset = MNIST(
         root="./data",
@@ -595,34 +412,21 @@ def main():
         transform=torchvision.transforms.ToTensor(),
     )
 
-    # --------------------------------------------------
-    # Visualizer (created once, reused for every image)
-    # --------------------------------------------------
-
     (
         fig,
-        ax_current,
-        ax_local,
-        ax_global,
-        ax_real,
         current_display,
         local_display,
+        mid_display,
         global_display,
         real_display,
     ) = create_visualizer()
 
-    # Track whether the user closed the plot window, so we can stop
-    # the auto-advance loop instead of erroring out on a dead figure.
     window_closed = {"value": False}
 
     def _on_close(event):
         window_closed["value"] = True
 
     fig.canvas.mpl_connect("close_event", _on_close)
-
-    # --------------------------------------------------
-    # Play through image after image automatically
-    # --------------------------------------------------
 
     episode_index = 0
 
@@ -639,6 +443,7 @@ def main():
             fig,
             current_display,
             local_display,
+            mid_display,
             global_display,
             real_display,
             episode_index,

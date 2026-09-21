@@ -1,15 +1,159 @@
 import torch
 import torch.nn.functional as F
 
-from .data import reveal_cells
+from .data import (
+    NUM_ACTIONS,
+    NUM_CELLS,
+    STOP_ACTION,  # noqa: F401
+    reveal_cells,
+)
 
-NUM_CELLS = 9
-STOP_ACTION = 9
-NUM_ACTIONS = 10
+NUM_CLASSES = 10
+LATENT_DIM = 128
+
+# --------------------------------------------------------------------------
+# State layout -- the ONE place that knows it. rl.py (action masking),
+# planner.py, play.py and eval_rl.py all import these instead of repeating
+# magic offsets like `128 + 10 + 1 + 1 + 1`.
+#
+#   z                       LATENT_DIM   (128)
+#   class probabilities     10
+#   entropy                 1
+#   confidence              1
+#   opened ratio            1
+#   opened mask             9
+#   candidate features      18   per cell: [P(correct) after reveal,
+#                                          that minus P(correct) now]
+#                                          (from the AccuracyHead; 0 if open)
+#                           ----
+#                           168
+# --------------------------------------------------------------------------
+
+Z_SLICE = slice(0, LATENT_DIM)
+PROB_SLICE = slice(LATENT_DIM, LATENT_DIM + NUM_CLASSES)
+ENTROPY_IDX = PROB_SLICE.stop
+CONFIDENCE_IDX = ENTROPY_IDX + 1
+OPENED_RATIO_IDX = CONFIDENCE_IDX + 1
+OPENED_MASK_SLICE = slice(OPENED_RATIO_IDX + 1, OPENED_RATIO_IDX + 1 + NUM_CELLS)
+CANDIDATE_SLICE = slice(OPENED_MASK_SLICE.stop, OPENED_MASK_SLICE.stop + 2 * NUM_CELLS)
+STATE_DIM = CANDIDATE_SLICE.stop  # 168
 
 
 def entropy(probabilities):
     return -(probabilities * torch.log(probabilities.clamp_min(1e-8))).sum(dim=-1)
+
+
+@torch.no_grad()
+def build_state(
+    model,
+    image,
+    opened,
+    device,
+):
+    """Builds the STATE_DIM-dim DQN state for `image` with the cells in
+    `opened` revealed.
+
+    Returns (state, info). `info` carries what other callers need without
+    recomputing it (planner / play / eval):
+
+        z, tokens_mid, tokens_local   encoder outputs, batch size 1
+        probabilities                 (10,) classifier probabilities
+        acc_now                       scalar tensor, P(correct) if we STOP now
+        acc_after                     (9,) P(correct) after revealing each cell
+    """
+
+    current_image, current_mask = reveal_cells(
+        image,
+        opened,
+    )
+
+    image_batch = current_image.unsqueeze(0).to(device)
+
+    mask_batch = current_mask.unsqueeze(0).to(device)
+
+    z, tokens_mid, tokens_local = model.encode(
+        image_batch,
+        mask_batch,
+    )
+
+    probabilities = F.softmax(
+        model.classifier(z),
+        dim=-1,
+    )
+
+    current_entropy = entropy(probabilities)
+
+    current_confidence = probabilities.max(dim=-1).values
+
+    opened_ratio = torch.tensor(
+        [len(opened) / NUM_CELLS],
+        device=device,
+        dtype=z.dtype,
+    )
+
+    opened_mask = torch.zeros(
+        1,
+        NUM_CELLS,
+        device=device,
+        dtype=z.dtype,
+    )
+
+    if opened:
+        opened_mask[0, list(opened)] = 1.0
+
+    # --------------------------------------------------
+    # Expected accuracy per action (AccuracyHead)
+    #
+    # Replaces the old "imagined entropy / confidence" (classifier applied to
+    # z_pred). That was confidence of an *averaged* latent, not the expected
+    # value of information. This is trained against the real next observation.
+    # --------------------------------------------------
+
+    accuracy = model.estimate_accuracy(
+        z,
+        opened_mask,
+    ).squeeze(0)  # (10,)
+
+    acc_after = accuracy[:NUM_CELLS]
+
+    acc_now = accuracy[STOP_ACTION]
+
+    candidate_features = torch.stack(
+        [
+            acc_after,
+            acc_after - acc_now,
+        ],
+        dim=-1,
+    )  # (9, 2)
+
+    # Opened cells should not provide useful candidate information.
+    candidate_features = candidate_features * (1.0 - opened_mask.squeeze(0)).unsqueeze(
+        -1
+    )
+
+    state = torch.cat(
+        [
+            z.squeeze(0),
+            probabilities.squeeze(0),
+            current_entropy,
+            current_confidence,
+            opened_ratio,
+            opened_mask.squeeze(0),
+            candidate_features.flatten(),
+        ],
+        dim=0,
+    )
+
+    info = {
+        "z": z,
+        "tokens_mid": tokens_mid,
+        "tokens_local": tokens_local,
+        "probabilities": probabilities.squeeze(0),
+        "acc_now": acc_now,
+        "acc_after": acc_after,
+    }
+
+    return state.detach(), info
 
 
 class ActiveMNISTEnv:
@@ -22,7 +166,7 @@ class ActiveMNISTEnv:
         correct_reward=1.0,
         wrong_reward=-1.0,
         max_steps=9,
-        info_gain_weight=0.5,
+        info_gain_weight=0.0,
     ):
         self.model = model
         self.dataset = dataset
@@ -33,20 +177,31 @@ class ActiveMNISTEnv:
         self.wrong_reward = wrong_reward
         self.max_steps = max_steps
 
-        # Reward, per reveal, for how much the entropy of the predicted
-        # digit actually dropped as a result of THAT specific reveal. This
-        # is what teaches the agent to pick informative cells rather than
-        # just any unopened cell — without it, every reveal costs the same
-        # flat `reveal_cost` regardless of whether it taught the agent
-        # anything, so "which cell to open" only ever gets an indirect
-        # signal (via the candidate_features already present in the state),
-        # never a direct one.
+        # Optional reward shaping, OFF by default.
+        #
+        # It used to be `w * max(H_before - H_after, 0)` on reveals only. That
+        # (a) ignores entropy increases, (b) gives STOP nothing, so every
+        # reveal was subsidised relative to STOP, and (c) silently cancelled
+        # the reveal_cost breakeven analysis (0.5 * 0.4 nats == 0.20 == the
+        # whole cost of a reveal), all while rewarding "confidently wrong".
+        #
+        # With w > 0 this is now POTENTIAL-BASED shaping with
+        # Phi(s) = -w * H(s), Phi(terminal) = 0 and gamma = 1:
+        #
+        #   reveal -> non-terminal s':   + w * (H(s) - H(s'))
+        #   any terminal transition:     + w * H(s)     (s = state acted from)
+        #
+        # Over a whole episode the bonuses telescope to exactly w * H(s_0), a
+        # constant, so shaping can speed up credit assignment but cannot
+        # change which policy is optimal. train_gamma must stay 1.0.
         self.info_gain_weight = info_gain_weight
 
         self.image = None
         self.label = None
         self.opened = []
         self.steps = 0
+
+        self._state = None
 
     def reset(self, index=None):
         if index is None:
@@ -63,130 +218,20 @@ class ActiveMNISTEnv:
         self.opened = []
         self.steps = 0
 
-        return self._get_state()
+        self._state = self._get_state()
+
+        return self._state
 
     @torch.no_grad()
     def _get_state(self):
-        current_image, current_mask = reveal_cells(
+        state, _ = build_state(
+            self.model,
             self.image,
             self.opened,
+            self.device,
         )
 
-        image = current_image.unsqueeze(0).to(self.device)
-        mask = current_mask.unsqueeze(0).to(self.device)
-
-        # --------------------------------------------------
-        # Current state
-        #
-        # Hierarchical encoder returns (z_global, tokens); the RL state is
-        # still built only from z_global so state_dim / layout is unchanged.
-        # --------------------------------------------------
-
-        z, tokens = self.model.encode(image, mask)
-
-        current_logits = self.model.classifier(z)
-
-        current_probabilities = F.softmax(
-            current_logits,
-            dim=-1,
-        )
-
-        current_entropy = entropy(current_probabilities)
-
-        current_confidence = current_probabilities.max(dim=-1).values
-
-        opened_ratio = torch.tensor(
-            [len(self.opened) / NUM_CELLS],
-            device=self.device,
-            dtype=z.dtype,
-        )
-
-        opened_mask = torch.zeros(
-            NUM_CELLS,
-            device=self.device,
-            dtype=z.dtype,
-        )
-
-        for cell in self.opened:
-            opened_mask[cell] = 1.0
-
-        # --------------------------------------------------
-        # JEPA imagination for every cell
-        # --------------------------------------------------
-
-        actions = torch.arange(
-            NUM_CELLS,
-            device=self.device,
-            dtype=torch.long,
-        )
-
-        z_repeated = z.expand(
-            NUM_CELLS,
-            -1,
-        )
-
-        tokens_repeated = tokens.expand(
-            NUM_CELLS,
-            -1,
-            -1,
-        )
-
-        z_pred, tokens_pred = self.model.predict(
-            z_repeated,
-            tokens_repeated,
-            actions,
-        )
-
-        imagined_logits = self.model.classifier(z_pred)
-
-        imagined_probabilities = F.softmax(
-            imagined_logits,
-            dim=-1,
-        )
-
-        imagined_entropy = entropy(imagined_probabilities)
-
-        imagined_confidence = imagined_probabilities.max(dim=-1).values
-
-        # Each cell gets:
-        #
-        #   imagined entropy
-        #   imagined confidence
-        #
-        # shape = [9, 2]
-        candidate_features = torch.stack(
-            [
-                imagined_entropy,
-                imagined_confidence,
-            ],
-            dim=-1,
-        )
-
-        # Opened cells should not provide useful
-        # candidate information.
-        for cell in self.opened:
-            candidate_features[cell] = 0.0
-
-        candidate_features = candidate_features.flatten()
-
-        # --------------------------------------------------
-        # Final state
-        # --------------------------------------------------
-
-        state = torch.cat(
-            [
-                z.squeeze(0),
-                current_probabilities.squeeze(0),
-                current_entropy,
-                current_confidence,
-                opened_ratio,
-                opened_mask,
-                candidate_features,
-            ],
-            dim=0,
-        )
-
-        return state.detach()
+        return state
 
     def valid_actions(self):
         actions = [cell for cell in range(NUM_CELLS) if cell not in self.opened]
@@ -203,20 +248,26 @@ class ActiveMNISTEnv:
         if action not in self.valid_actions():
             raise ValueError(f"Invalid action: {action}")
 
+        # The state the agent acted from was already computed (reset / previous
+        # step). Reusing it halves the JEPA forward passes per step.
+        state_before = self._state
+
+        entropy_before = state_before[ENTROPY_IDX].item()
+
+        shaping = self.info_gain_weight
+
         # --------------------------------------------------
         # STOP
         # --------------------------------------------------
 
         if action == STOP_ACTION:
-            state = self._get_state()
-
-            probabilities = state[128 : 128 + 10]
-
-            prediction = probabilities.argmax().item()
+            prediction = state_before[PROB_SLICE].argmax().item()
 
             correct = prediction == self.label
 
             reward = self.correct_reward if correct else self.wrong_reward
+
+            reward += shaping * entropy_before
 
             info = {
                 "type": "stop",
@@ -227,7 +278,7 @@ class ActiveMNISTEnv:
             }
 
             return (
-                state,
+                state_before,
                 reward,
                 True,
                 info,
@@ -237,42 +288,32 @@ class ActiveMNISTEnv:
         # REVEAL
         # --------------------------------------------------
 
-        # Entropy BEFORE this specific reveal, so we can reward this action
-        # in proportion to how much uncertainty it actually removed.
-        state_before = self._get_state()
-
-        probabilities_before = state_before[128 : 128 + 10]
-
-        entropy_before = entropy(probabilities_before.unsqueeze(0)).item()
-
         self.opened.append(action)
         self.steps += 1
 
+        next_state = self._get_state()
+
+        self._state = next_state
+
         reward = -self.reveal_cost
 
+        entropy_after = next_state[ENTROPY_IDX].item()
+
+        probabilities = next_state[PROB_SLICE]
+
+        prediction = probabilities.argmax().item()
+
         # --------------------------------------------------
-        # Maximum number of reveals
+        # Maximum number of reveals (or nothing left to reveal): the episode
+        # ends and the current belief is graded.
         # --------------------------------------------------
 
-        if self.steps >= self.max_steps:
-            state = self._get_state()
-
-            probabilities = state[128 : 128 + 10]
-
-            entropy_after = entropy(probabilities.unsqueeze(0)).item()
-
-            info_gain = max(entropy_before - entropy_after, 0.0)
-
-            reward += self.info_gain_weight * info_gain
-
-            prediction = probabilities.argmax().item()
-
+        if self.steps >= min(self.max_steps, NUM_CELLS):
             correct = prediction == self.label
 
-            if correct:
-                reward += self.correct_reward
-            else:
-                reward += self.wrong_reward
+            reward += self.correct_reward if correct else self.wrong_reward
+
+            reward += shaping * entropy_before
 
             info = {
                 "type": "max_steps",
@@ -280,11 +321,11 @@ class ActiveMNISTEnv:
                 "label": self.label,
                 "correct": correct,
                 "opened": len(self.opened),
-                "info_gain": info_gain,
+                "info_gain": entropy_before - entropy_after,
             }
 
             return (
-                state,
+                next_state,
                 reward,
                 True,
                 info,
@@ -294,27 +335,16 @@ class ActiveMNISTEnv:
         # Continue
         # --------------------------------------------------
 
-        next_state = self._get_state()
-
-        probabilities = next_state[128 : 128 + 10]
-
-        entropy_after = entropy(probabilities.unsqueeze(0)).item()
-
-        info_gain = max(entropy_before - entropy_after, 0.0)
-
-        reward += self.info_gain_weight * info_gain
-
-        prediction = probabilities.argmax().item()
-        confidence = probabilities.max().item()
+        reward += shaping * (entropy_before - entropy_after)
 
         info = {
             "type": "reveal",
             "cell": action,
             "prediction": prediction,
-            "confidence": confidence,
+            "confidence": probabilities.max().item(),
             "label": self.label,
             "opened": len(self.opened),
-            "info_gain": info_gain,
+            "info_gain": entropy_before - entropy_after,
         }
 
         return (

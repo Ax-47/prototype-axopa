@@ -16,7 +16,7 @@ dependencies = [
 train-jepa = "jepa_test.train:main"
 train-rl = "jepa_test.train_rl:main"
 play-jepa = "jepa_test.play:main"
-
+eval_rl = "jepa_test.eval_rl:main"
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
 build-backend = "uv_build"

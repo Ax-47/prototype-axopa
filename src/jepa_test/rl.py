@@ -1,13 +1,10 @@
 import random
-from collections import deque
 
 import torch
 import torch.nn as nn
 
-
-NUM_ACTIONS = 10
-STOP_ACTION = 9
-NUM_CELLS = 9
+from .data import NUM_ACTIONS, NUM_CELLS, STOP_ACTION
+from .environment import OPENED_MASK_SLICE
 
 
 class QNetwork(nn.Module):
@@ -41,8 +38,31 @@ class QNetwork(nn.Module):
 
 
 class ReplayBuffer:
-    def __init__(self, capacity=100_000):
-        self.buffer = deque(maxlen=capacity)
+    """Ring buffer of preallocated tensors.
+
+    Replaces the old `deque` of tuples: `random.sample` on a deque indexes
+    into the middle (O(n)), and every sample re-stacked 128 small CPU tensors
+    and copied them to the GPU. Here storage lives on `device` (default CPU),
+    pushes are in-place row writes, and sampling is one `randint` + indexing.
+    """
+
+    def __init__(
+        self,
+        capacity,
+        state_dim,
+        device="cpu",
+    ):
+        self.capacity = capacity
+        self.device = torch.device(device)
+
+        self.states = torch.zeros(capacity, state_dim, device=self.device)
+        self.next_states = torch.zeros(capacity, state_dim, device=self.device)
+        self.actions = torch.zeros(capacity, dtype=torch.long, device=self.device)
+        self.rewards = torch.zeros(capacity, device=self.device)
+        self.dones = torch.zeros(capacity, device=self.device)
+
+        self.position = 0
+        self.size = 0
 
     def push(
         self,
@@ -52,79 +72,46 @@ class ReplayBuffer:
         next_state,
         done,
     ):
-        self.buffer.append(
-            (
-                state.detach().cpu(),
-                int(action),
-                float(reward),
-                next_state.detach().cpu(),
-                bool(done),
-            )
-        )
+        i = self.position
+
+        self.states[i] = state.detach().to(self.device)
+        self.next_states[i] = next_state.detach().to(self.device)
+        self.actions[i] = int(action)
+        self.rewards[i] = float(reward)
+        self.dones[i] = float(bool(done))
+
+        self.position = (i + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size):
-        batch = random.sample(
-            self.buffer,
-            batch_size,
-        )
-
-        (
-            states,
-            actions,
-            rewards,
-            next_states,
-            dones,
-        ) = zip(*batch)
-
-        states = torch.stack(states)
-        next_states = torch.stack(next_states)
-
-        actions = torch.tensor(
-            actions,
-            dtype=torch.long,
-        )
-
-        rewards = torch.tensor(
-            rewards,
-            dtype=torch.float32,
-        )
-
-        dones = torch.tensor(
-            dones,
-            dtype=torch.float32,
+        index = torch.randint(
+            0,
+            self.size,
+            (batch_size,),
+            device=self.device,
         )
 
         return (
-            states,
-            actions,
-            rewards,
-            next_states,
-            dones,
+            self.states[index],
+            self.actions[index],
+            self.rewards[index],
+            self.next_states[index],
+            self.dones[index],
         )
 
     def __len__(self):
-        return len(self.buffer)
+        return self.size
 
 
 def mask_invalid_actions(
     q_values,
     state,
 ):
+    """-inf on reveal actions whose cell is already open. STOP is never masked."""
+
     q_values = q_values.clone()
 
-    # State layout:
-    #
-    # z              = 128
-    # probabilities  = 10
-    # entropy        = 1
-    # confidence     = 1
-    # opened ratio   = 1
-    # opened mask    = 9
-    # candidate      = 18
-    #
-    # opened mask starts at 141.
-
-    opened_mask = state[:, 128 + 10 + 1 + 1 + 1 : 128 + 10 + 1 + 1 + 1 + 9]
+    opened_mask = state[:, OPENED_MASK_SLICE]
 
     q_values[:, :NUM_CELLS] = q_values[:, :NUM_CELLS].masked_fill(
         opened_mask > 0.5,
@@ -139,24 +126,25 @@ def select_action(
     state,
     epsilon,
     device,
-    stop_exploration_probability=0.30,
 ):
     # --------------------------------------------------
     # Exploration
+    #
+    # Uniform over ALL valid actions, STOP included. With k unopened cells
+    # STOP is picked with probability 1/(k+1), so exploratory episodes end at
+    # every depth 0..9 with equal probability. (The old "force STOP with
+    # probability 0.6*epsilon" made P(reach depth j) ~ 0.4^j: the replay
+    # buffer had almost no states with >4 cells open early in training.)
     # --------------------------------------------------
 
     if random.random() < epsilon:
-        opened_mask = state[128 + 10 + 1 + 1 + 1 : 128 + 10 + 1 + 1 + 1 + 9]
+        opened_mask = state[OPENED_MASK_SLICE].tolist()
 
-        valid_cells = [
-            cell for cell in range(NUM_CELLS) if opened_mask[cell].item() < 0.5
-        ]
+        valid_actions = [cell for cell in range(NUM_CELLS) if opened_mask[cell] < 0.5]
 
-        # Explicitly force STOP exploration sometimes.
-        if random.random() < stop_exploration_probability:
-            return STOP_ACTION
+        valid_actions.append(STOP_ACTION)
 
-        return random.choice(valid_cells)
+        return random.choice(valid_actions)
 
     # --------------------------------------------------
     # Exploitation
@@ -184,7 +172,8 @@ def train_dqn_step(
     replay_buffer,
     batch_size,
     gamma,
-    device,
+    device=None,  # kept for call compatibility; the buffer already lives on its device
+    double_dqn=True,
 ):
     if len(replay_buffer) < batch_size:
         return None
@@ -196,12 +185,6 @@ def train_dqn_step(
         next_states,
         dones,
     ) = replay_buffer.sample(batch_size)
-
-    states = states.to(device)
-    actions = actions.to(device)
-    rewards = rewards.to(device)
-    next_states = next_states.to(device)
-    dones = dones.to(device)
 
     # --------------------------------------------------
     # Current Q
@@ -216,19 +199,44 @@ def train_dqn_step(
 
     # --------------------------------------------------
     # Target Q
+    #
+    # Double DQN: the online network picks the best VALID next action, the
+    # target network evaluates it (less over-estimation than max over the
+    # target network's own noisy Q-values).
     # --------------------------------------------------
 
     with torch.no_grad():
-        next_q_values = target_network(next_states)
+        if double_dqn:
+            online_next_q = mask_invalid_actions(
+                q_network(next_states),
+                next_states,
+            )
 
-        next_q_values = mask_invalid_actions(
-            next_q_values,
-            next_states,
-        )
+            best_next_action = online_next_q.argmax(
+                dim=1,
+                keepdim=True,
+            )
 
-        max_next_q = next_q_values.max(dim=1).values
+            next_q = (
+                target_network(next_states)
+                .gather(
+                    1,
+                    best_next_action,
+                )
+                .squeeze(1)
+            )
 
-        target = rewards + gamma * (1.0 - dones) * max_next_q
+        else:
+            next_q = (
+                mask_invalid_actions(
+                    target_network(next_states),
+                    next_states,
+                )
+                .max(dim=1)
+                .values
+            )
+
+        target = rewards + gamma * (1.0 - dones) * next_q
 
     # --------------------------------------------------
     # Optimize
