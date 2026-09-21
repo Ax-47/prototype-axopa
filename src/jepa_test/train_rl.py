@@ -114,14 +114,27 @@ def main():
         model=jepa,
         dataset=dataset,
         device=device,
-        # Raised from 0.10: with the old cost, opening a cell only needed to
-        # improve accuracy by ~5% to be "worth it" (reveal_cost / (correct_reward
-        # - wrong_reward) = 0.10 / 2.0), so the agent almost always kept opening
-        # cells instead of stopping. 0.20 raises that breakeven to ~10%.
+        # Kept moderate on purpose. Breakeven for "is one more reveal worth
+        # it?" = reveal_cost / (correct_reward - wrong_reward):
+        #   - old:      0.10 / 2.0  = 5%   -> agent almost always kept opening
+        #   - balanced: 0.20 / 2.0  = 10%  -> has to actually be more confident
+        # An extreme wrong_reward (e.g. -10.0) would drop that breakeven back
+        # down to ~1.8%, undoing the point of raising reveal_cost at all — so
+        # wrong_reward is kept at a normal magnitude, not blown up.
         reveal_cost=0.20,
         correct_reward=1.0,
         wrong_reward=-1.0,
+        # No artificial cap: max_steps=9 lets the agent use the full grid if
+        # it genuinely needs to, and lets reveal_cost + info_gain do the
+        # actual work of teaching it when enough is enough, rather than a
+        # hard wall forcing it to always spend its whole "budget".
         max_steps=9,
+        # NEW: rewards each reveal in proportion to how much it actually
+        # reduced prediction entropy — this is what teaches the agent WHICH
+        # cell is smart to open, not just when to stop. Without this, cell
+        # choice only gets an indirect signal via the candidate_features
+        # already present in the state.
+        info_gain_weight=0.5,
     )
 
     state = env.reset()

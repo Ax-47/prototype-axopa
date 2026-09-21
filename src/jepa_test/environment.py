@@ -22,6 +22,7 @@ class ActiveMNISTEnv:
         correct_reward=1.0,
         wrong_reward=-1.0,
         max_steps=9,
+        info_gain_weight=0.5,
     ):
         self.model = model
         self.dataset = dataset
@@ -31,6 +32,16 @@ class ActiveMNISTEnv:
         self.correct_reward = correct_reward
         self.wrong_reward = wrong_reward
         self.max_steps = max_steps
+
+        # Reward, per reveal, for how much the entropy of the predicted
+        # digit actually dropped as a result of THAT specific reveal. This
+        # is what teaches the agent to pick informative cells rather than
+        # just any unopened cell — without it, every reveal costs the same
+        # flat `reveal_cost` regardless of whether it taught the agent
+        # anything, so "which cell to open" only ever gets an indirect
+        # signal (via the candidate_features already present in the state),
+        # never a direct one.
+        self.info_gain_weight = info_gain_weight
 
         self.image = None
         self.label = None
@@ -226,6 +237,14 @@ class ActiveMNISTEnv:
         # REVEAL
         # --------------------------------------------------
 
+        # Entropy BEFORE this specific reveal, so we can reward this action
+        # in proportion to how much uncertainty it actually removed.
+        state_before = self._get_state()
+
+        probabilities_before = state_before[128 : 128 + 10]
+
+        entropy_before = entropy(probabilities_before.unsqueeze(0)).item()
+
         self.opened.append(action)
         self.steps += 1
 
@@ -239,6 +258,12 @@ class ActiveMNISTEnv:
             state = self._get_state()
 
             probabilities = state[128 : 128 + 10]
+
+            entropy_after = entropy(probabilities.unsqueeze(0)).item()
+
+            info_gain = max(entropy_before - entropy_after, 0.0)
+
+            reward += self.info_gain_weight * info_gain
 
             prediction = probabilities.argmax().item()
 
@@ -255,6 +280,7 @@ class ActiveMNISTEnv:
                 "label": self.label,
                 "correct": correct,
                 "opened": len(self.opened),
+                "info_gain": info_gain,
             }
 
             return (
@@ -272,6 +298,12 @@ class ActiveMNISTEnv:
 
         probabilities = next_state[128 : 128 + 10]
 
+        entropy_after = entropy(probabilities.unsqueeze(0)).item()
+
+        info_gain = max(entropy_before - entropy_after, 0.0)
+
+        reward += self.info_gain_weight * info_gain
+
         prediction = probabilities.argmax().item()
         confidence = probabilities.max().item()
 
@@ -282,6 +314,7 @@ class ActiveMNISTEnv:
             "confidence": confidence,
             "label": self.label,
             "opened": len(self.opened),
+            "info_gain": info_gain,
         }
 
         return (
